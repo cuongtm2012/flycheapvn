@@ -17,7 +17,7 @@ from database import (
     set_cache,
 )
 from sources import AmadeusSource, AviasalesSource, FlyScraperSource, KiwiSource, SerpAPISource, SkyscannerSource
-from utils import make_cache_key
+from utils import format_price_vnd, make_cache_key
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,44 @@ class APIRouter:
         result = await self.search(origin, dest, date_from, limit=1)
         flights = result.get("flights", [])
         return flights[0]["price"] if flights else None
+
+    async def get_price_calendar(
+        self,
+        origin: str,
+        dest: str,
+        limit: int = 5,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Lấy top N ngày rẻ nhất, có thể lọc theo khoảng ngày."""
+        from utils import filter_calendar_by_range
+
+        for source in self._ordered_sources():
+            if not hasattr(source, "price_calendar"):
+                continue
+            if not increment_source_rate(source.name, source.max_per_hour):
+                continue
+            try:
+                calendar = await source.price_calendar(origin.upper(), dest.upper())
+                if calendar:
+                    record_source_result(source.name, True)
+                    if date_from:
+                        calendar = filter_calendar_by_range(calendar, date_from, date_to)
+                    sorted_days = sorted(calendar, key=lambda x: x["price_vnd"])[:limit]
+                    return [
+                        {
+                            "day": d["day"],
+                            "price": d["price_vnd"],
+                            "price_str": format_price_vnd(d["price_vnd"]),
+                            "airline": d.get("airline", ""),
+                        }
+                        for d in sorted_days
+                    ]
+                record_source_result(source.name, False)
+            except Exception as exc:
+                logger.warning("price_calendar %s failed: %s", source.name, exc)
+                record_source_result(source.name, False)
+        return []
 
     @staticmethod
     def _empty_result() -> dict[str, Any]:

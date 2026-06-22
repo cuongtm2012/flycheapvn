@@ -5,3 +5,10 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+.DS_Store
+*.db
+*.jpeg
+*.jpg
+*.png
+*.webp
+*.excalidraw

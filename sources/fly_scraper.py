@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import httpx
 
-from utils import USD_TO_VND, vnd_to_usd
+from utils import USD_TO_VND, date_in_range, flights_in_range, vnd_to_usd
 
 logger = logging.getLogger(__name__)
 
@@ -78,14 +78,14 @@ class FlyScraperSource:
                 )
         except httpx.TimeoutException:
             logger.warning("Fly Scraper timeout for %s-%s", origin, dest)
-            return await self._search_via_calendar(origin, dest, date_from, max_price, currency, limit)
+            return await self._search_via_calendar(origin, dest, date_from, date_to, max_price, currency, limit)
 
         if resp.status_code == 429:
             return {"success": False, "rate_limited": True, "source": self.name, "flights": []}
 
         if resp.status_code != 200:
             logger.warning("Fly Scraper error %s: %s", resp.status_code, resp.text[:200])
-            return await self._search_via_calendar(origin, dest, date_from, max_price, currency, limit)
+            return await self._search_via_calendar(origin, dest, date_from, date_to, max_price, currency, limit)
 
         try:
             data = resp.json()
@@ -94,7 +94,7 @@ class FlyScraperSource:
 
         if not data.get("status"):
             logger.warning("Fly Scraper API status false: %s", data.get("message", "")[:200])
-            return await self._search_via_calendar(origin, dest, date_from, max_price, currency, limit)
+            return await self._search_via_calendar(origin, dest, date_from, date_to, max_price, currency, limit)
 
         flights = self._parse_itineraries(
             data.get("data", {}),
@@ -103,11 +103,24 @@ class FlyScraperSource:
             currency,
             max_price,
             limit,
+            requested_date=date_from,
         )
         if flights:
-            return {"success": True, "source": self.name, "flights": flights, "cached": False}
+            mismatched = not flights_in_range(flights, date_from, date_to)
+            payload: dict[str, Any] = {
+                "success": True,
+                "source": self.name,
+                "flights": flights,
+                "cached": False,
+            }
+            if mismatched:
+                payload["date_mismatch"] = True
+                payload["requested_date"] = date_from
+            return payload
 
-        return await self._search_via_calendar(origin, dest, date_from, max_price, currency, limit)
+        return await self._search_via_calendar(
+            origin, dest, date_from, date_to, max_price, currency, limit
+        )
 
     def _parse_itineraries(
         self,
@@ -117,6 +130,7 @@ class FlyScraperSource:
         currency: str,
         max_price: Optional[int],
         limit: int,
+        requested_date: Optional[str] = None,
     ) -> list[dict[str, Any]]:
         flights: list[dict[str, Any]] = []
         for item in payload.get("itineraries", [])[: limit * 2]:
@@ -179,6 +193,7 @@ class FlyScraperSource:
         origin: str,
         dest: str,
         date_from: str,
+        date_to: Optional[str],
         max_price: Optional[int],
         currency: str,
         limit: int,
@@ -187,8 +202,17 @@ class FlyScraperSource:
         if not calendar:
             return {"success": False, "source": self.name, "flights": []}
 
-        matched = [d for d in calendar if d["day"] == date_from]
-        pool = matched or sorted(calendar, key=lambda x: x["price_vnd"])[:limit]
+        in_range = [
+            d for d in calendar
+            if date_in_range(d["day"], date_from, date_to)
+        ] if date_to else [d for d in calendar if d["day"] == date_from]
+        pool = in_range or sorted(calendar, key=lambda x: x["price_vnd"])[:limit]
+        note = None
+        if not in_range and date_to:
+            note = (
+                f"Chưa có lịch giá trong khoảng {date_from} → {date_to}. "
+                "Dưới đây là ngày rẻ nhất hiện có từ API:"
+            )
 
         flights = []
         for day in pool[:limit]:
@@ -210,7 +234,16 @@ class FlyScraperSource:
                 "booking_url": "",
             })
 
-        return {"success": bool(flights), "source": self.name, "flights": flights, "cached": False}
+        result: dict[str, Any] = {
+            "success": bool(flights),
+            "source": self.name,
+            "flights": flights,
+            "cached": False,
+        }
+        if note:
+            result["calendar_note"] = note
+            result["date_mismatch"] = True
+        return result
 
     async def price_calendar(self, origin: str, dest: str) -> list[dict[str, Any]]:
         params = {

@@ -35,6 +35,10 @@ AIRPORT_ALIASES: dict[str, str] = {
     "taipei": "TPE", "tpe": "TPE",
 }
 
+# Set of Vietnamese domestic airport codes
+VN_DOMESTIC_AIRPORTS = {"HAN", "SGN", "DAD", "DLI", "CXR", "PQC", "HPH", "HUI",
+                         "VII", "UIH", "VCA", "VKG", "BMV", "PXU", "TBB"}
+
 AIRLINE_NAMES: dict[str, str] = {
     "VJ": "VietJet Air",
     "VN": "Vietnam Airlines",
@@ -122,6 +126,99 @@ def format_date_vn(iso_str: str) -> str:
 def make_cache_key(params: dict[str, Any]) -> str:
     normalized = json.dumps(params, sort_keys=True, default=str)
     return hashlib.sha256(normalized.encode()).hexdigest()
+
+
+PROMO_KEYWORDS = (
+    "khuyến mãi", "khuyen mai", "khuyến mại", "khuyen mai",
+    "giảm giá", "giam gia", "sale", "deal", "0 đồng", "flash sale",
+)
+
+
+def is_promo_related(text: str) -> bool:
+    t = text.lower()
+    return any(kw in t for kw in PROMO_KEYWORDS)
+
+
+def month_end(date_from: str) -> str:
+    """Last day of month for YYYY-MM-DD (typically day 1 of month)."""
+    d = date.fromisoformat(date_from[:10])
+    if d.month == 12:
+        return f"{d.year}-12-31"
+    next_month = date(d.year, d.month + 1, 1)
+    last = next_month - timedelta(days=1)
+    return last.isoformat()
+
+
+def ensure_date_range(date_from: Optional[str], date_to: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    if not date_from:
+        return None, date_to
+    if date_to:
+        return date_from[:10], date_to[:10]
+    d = date.fromisoformat(date_from[:10])
+    if d.day == 1:
+        return date_from[:10], month_end(date_from)
+    return date_from[:10], date_to
+
+
+def is_month_or_range_query(parsed: dict[str, Any]) -> bool:
+    raw = (parsed.get("raw_message") or "").lower()
+    if parsed.get("date_to"):
+        return True
+    return any(kw in raw for kw in ("tháng", "thang", "cuối năm", "cuoi nam", "từ bây giờ", "tu bay gio"))
+
+
+def date_in_range(day: str, date_from: str, date_to: Optional[str]) -> bool:
+    d = day[:10]
+    if d < date_from[:10]:
+        return False
+    if date_to and d > date_to[:10]:
+        return False
+    return True
+
+
+def filter_calendar_by_range(
+    calendar: list[dict[str, Any]],
+    date_from: Optional[str],
+    date_to: Optional[str],
+) -> list[dict[str, Any]]:
+    if not date_from:
+        return calendar
+    return [d for d in calendar if date_in_range(d["day"], date_from, date_to)]
+
+
+def flights_in_range(
+    flights: list[dict[str, Any]],
+    date_from: str,
+    date_to: Optional[str],
+) -> list[dict[str, Any]]:
+    return [
+        f for f in flights
+        if date_in_range((f.get("departure") or "")[:10], date_from, date_to)
+    ]
+
+
+def format_month_label(date_from: str, date_to: Optional[str]) -> str:
+    d = date.fromisoformat(date_from[:10])
+    if date_to and date_to[:7] != date_from[:7]:
+        return f"{date_from[:7]} → {date_to[:7]}"
+    return f"tháng {d.month}/{d.year}"
+
+
+def is_domestic_route(origin: str, dest: str) -> bool:
+    """Check if both airports are Vietnamese domestic."""
+    return origin in VN_DOMESTIC_AIRPORTS and dest in VN_DOMESTIC_AIRPORTS
+
+
+def filter_domestic_flights(flights: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter out flights with non-Vietnamese airlines on domestic routes.
+    Airline codes starting with letters outside VN domestic airlines (VJ, VN, QH, VU, BL)
+    are suspicious on domestic VN routes.
+    """
+    VN_AIRLINES = {"VJ", "VN", "QH", "VU", "BL"}
+    return [
+        f for f in flights
+        if f.get("airline") in VN_AIRLINES or f.get("duration_minutes", 0) <= 180
+    ]
 
 
 def parse_relative_date(text: str, reference: Optional[date] = None) -> Optional[str]:

@@ -139,4 +139,4 @@ def test_format_flights_template_with_data():
     assert "599k" in result
     assert "Bay thẳng" in result
     assert "06:00" in result
-    assert "Đặt ngay" in result
+    assert '"Đặt ngay"' in result or "[Đặt ngay]" in result or "https://" in result

@@ -93,11 +93,30 @@ class ResponseBuilder:
         dest = parsed.get("destination") or (flights[0]["dest"] if flights else "???")
         date_from = parsed.get("date_from") or ""
 
+        use_calendar_only = data.get("use_calendar_only", False)
+        calendar = data.get("price_calendar", [])
+
+        if use_calendar_only and calendar:
+            body = self._calendar_as_main(origin, dest, calendar, parsed, data.get("calendar_note"))
+            return body
+
         if not flights:
+            if calendar:
+                return self._calendar_as_main(origin, dest, calendar, parsed, data.get("calendar_note"))
             msg = data.get("message", "Không tìm thấy chuyến bay phù hợp.")
             return f"😔 {msg}\n\n💡 Thử đổi ngày hoặc tăng budget nhé!"
 
         template = _format_flights_template(origin, dest, date_from, flights, data)
+        if data.get("calendar_note"):
+            template = data["calendar_note"] + "\n\n" + template
+        elif data.get("date_mismatch"):
+            req = parsed.get("date_from", "")
+            template = (
+                f"⚠️ _Chuyến bay dưới đây không khớp ngày {req} — chỉ mang tính tham khảo._\n\n"
+                + template
+            )
+        if calendar:
+            template += self._price_calendar_block(calendar)
         if self.client:
             try:
                 llm_text = await self._llm_format(template, "search_flight")
@@ -107,6 +126,38 @@ class ResponseBuilder:
                 logger.warning("LLM format failed: %s", exc)
 
         return template
+
+    def _price_calendar_block(self, calendar: list[dict]) -> str:
+        if not calendar:
+            return ""
+        lines = ["\n📅 *Top ngày rẻ nhất trong tháng:*"]
+        for i, day in enumerate(calendar[:5], 1):
+            lines.append(f"  {i}. {day['day']} — {day['price_str']}")
+        return "\n".join(lines)
+
+    def _calendar_as_main(
+        self,
+        origin: str,
+        dest: str,
+        calendar: list[dict],
+        parsed: dict[str, Any],
+        note: Optional[str] = None,
+    ) -> str:
+        label = parsed.get("month_label") or parsed.get("date_from", "hôm nay")
+        lines = [
+            f"✈️ {origin} → {dest}",
+        ]
+        if note:
+            lines.append(note)
+        lines.append(f"📅 *Các ngày rẻ nhất — {label}*")
+        lines.append("─────────────────────────")
+        for i, day in enumerate(calendar[:10], 1):
+            medal = MEDALS[i - 1] if i - 1 < len(MEDALS) else f"{i}."
+            airline = f" ({day['airline']})" if day.get("airline") else ""
+            lines.append(f"{medal} {day['day']} — {day['price_str']}{airline}")
+
+        lines.append("\n💡 Gõ *tìm vé HN-SG ngày 10/7* để xem chi tiết giờ bay!")
+        return "\n".join(lines)
 
     def _set_alert(self, data: dict[str, Any]) -> str:
         if data.get("error"):
@@ -142,12 +193,18 @@ class ResponseBuilder:
         return "\n".join(lines)
 
     def _promo_check(self, parsed: dict[str, Any]) -> str:
+        return self.promo_snippet(parsed)
+
+    def promo_snippet(self, parsed: dict[str, Any]) -> str:
+        origin = parsed.get("origin", "")
+        dest = parsed.get("destination", "")
+        route = f"{origin}→{dest}" if origin and dest else "nội địa"
         return (
-            "🔥 *Khuyến mãi đang hot:*\n\n"
-            "• VietJet: Flash sale 0đ + phí (theo lịch hãng)\n"
-            "• Bamboo: Giảm 15% tuyến nội địa (mùa thấp điểm)\n"
-            "• Vietnam Airlines: Combo khứ hồi tiết kiệm\n\n"
-            "💡 Mẹo: Theo dõi fanpage hãng + đặt alert: /theodoi HAN-SGN duoi 800k"
+            "🔥 *Khuyến mãi / deal tham khảo:*\n\n"
+            f"• *VietJet:* Flash sale 0đ + phí — hay có tuyến {route}\n"
+            "• *Bamboo:* Giảm ~15% mùa thấp điểm (theo lịch hãng)\n"
+            "• *Vietnam Airlines:* Combo khứ hồi, ưu đãi thẻ ngân hàng\n\n"
+            "💡 Theo dõi fanpage hãng + `/theodoi HAN-SGN duoi 800k` để em báo khi có deal!"
         )
 
     def _compare(self, data: dict[str, Any], parsed: dict[str, Any]) -> str:
@@ -273,7 +330,12 @@ def _format_flights_template(
         lines.append(f"{medal} {f['airline_name']} {format_price_vnd(f['price'])}")
         lines.append(f"   🕐 {dep}→{arr} | {stops} {dur}")
         if f.get("booking_url"):
-            lines.append(f"   🔗 Đặt ngay: {f['booking_url']}")
+            url = f["booking_url"]
+            # Rút gọn URL nếu quá dài bằng markdown link
+            if len(url) > 80:
+                lines.append(f"   🔗 [Đặt ngay]({url})")
+            else:
+                lines.append(f"   🔗 Đặt ngay: {url}")
 
-    lines.append("\n💡 Mẹo: Đặt trước 3 tuần để có giá tốt nhất!")
+    lines.append(f"\n💡 Mẹo: Đặt trước 3 tuần để có giá tốt nhất!")
     return "\n".join(lines)
