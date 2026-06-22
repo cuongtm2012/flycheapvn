@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from ai_router import AIRouter
@@ -124,8 +125,11 @@ async def _handle_message(
                     f"• {n['origin']}→{n['dest']}: {format_price_vnd(n['price'])}"
                 )
             reply += "\n".join(notify_lines)
-
-        await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        try:
+            await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        except BadRequest:
+            # Fallback nếu markdown lỗi (underscore, ký tự đặc biệt)
+            await update.message.reply_text(reply, disable_web_page_preview=True)
 
     except Exception as exc:
         logger.exception("Handler error: %s", exc)

@@ -24,7 +24,7 @@ def _dt_to_iso(dt: dict[str, int]) -> str:
 
 
 def _milli_to_vnd(amount: Any, currency: str) -> int:
-    value = int(amount) / 1000  # PRICE_UNIT_MILLI → major currency unit
+    value = int(amount) / 1000
     if currency == "VND":
         return int(value)
     if currency == "USD":
@@ -160,8 +160,8 @@ class FlyScraperSource:
                 "price": price_vnd,
                 "currency": "VND",
                 "price_usd": vnd_to_usd(price_vnd),
-                "departure": _dt_to_iso(dep_dt) if dep_dt else date_from_default(),
-                "arrival": _dt_to_iso(arr_dt) if arr_dt else date_from_default(),
+                "departure": _dt_to_iso(dep_dt) if dep_dt else date_now_str(),
+                "arrival": _dt_to_iso(arr_dt) if arr_dt else date_now_str(),
                 "origin": origin,
                 "dest": dest,
                 "stops": leg.get("stopCount", 0),
@@ -267,6 +267,6 @@ class FlyScraperSource:
         return min(d["price_vnd"] for d in calendar)
 
 
-def date_from_default() -> str:
+def date_now_str() -> str:
     from datetime import datetime
     return datetime.utcnow().strftime("%Y-%m-%dT00:00:00")

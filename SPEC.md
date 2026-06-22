@@ -139,53 +139,73 @@ User msg → Telegram Bot Handler
 ### 4.1 Telegram Bot Handler
 - File: `bot.py`
 - python-telegram-bot v20+ (async)
-- Handlers: MessageHandler (text), CommandHandler (/start, /help, /theodoi, /check-alerts)
-- Rate limit: tránh spam (1 user tối đa 5 req/phút)
+- Handlers: CommandHandler (/start, /help, /uptime, /theodoi, /check-alerts) + MessageHandler (text)
+- Rate limit: 5 req/phút/user (user_rate_limits table)
+- Markdown fallback: nếu ParseMode.MARKDOWN lỗi → tự động retry không format
 
 ### 4.2 AI Classifier & Entity Parser
 - File: `ai_router.py`
-- System prompt: phân loại câu hỏi vào 1 trong 8 use case
-- Extract entities: origin, destination, date_from, date_to, max_price, airline, trip_type
-- Dùng DeepSeek Flash v4 API (cheap, fast)
-- Fallback: nếu API lỗi → regex-based parser đơn giản
+- Dùng **DeepSeek Flash v4** (env: DEEPSEEK_API_KEY, DEEPSEEK_MODEL)
+- 11 intents: search_flight | promo_check | compare | advice | schedule | set_alert | check_alerts | lucky_date | group_lucky_date | price_predict | general_chat
+- Extract entities: origin, destination, date_from, date_to, max_price, airline, trip_type, birth_year, group_birth_years
+- **Session memory:** Lưu lịch sử chat (max 10 turn) → LLM nhớ context
+- **Fallback:** Nếu DeepSeek lỗi → `regex_parse_intent()` trong utils.py (đầy đủ intent + route + price + date)
 
-**System Prompt (skeleton):**
+**System Prompt:**
 ```
 Bạn là trợ lý săn vé máy bay FlyCheapVN. Nhiệm vụ:
-1. Phân loại ý định người dùng: search_flight | promo_check | compare | advice | schedule | set_alert | check_alerts | general_chat
+1. Phân loại ý định người dùng vào MỘT trong các intent:
+   search_flight | promo_check | compare | advice | schedule | set_alert |
+   check_alerts | lucky_date | group_lucky_date | price_predict | general_chat
 2. Trích xuất thông tin cần thiết (mã sân bay, ngày, budget, hãng...)
-3. Trả về JSON
+3. Trả về JSON thuần, không markdown
 
-Quy tắc mã sân bay:
-- Hà Nội = HAN, Sài Gòn/HCM = SGN, Đà Nẵng = DAD
-- Đà Lạt = DLI, Nha Trang = CXR, Phú Quốc = PQC
-- Hải Phòng = HPH, Huế = HUI, Vinh = VII
-- Quy Nhơn = UIH, Cần Thơ = VCA, Rạch Giá = VKG
-- Buôn Ma Thuột = BMV, Pleiku = PXU, Tuy Hòa = TBB
-- Bangkok = BKK, Seoul = ICN, Singapore = SIN
+Schema JSON:
+{
+  "intent": "search_flight",
+  "origin": "HAN",
+  "destination": "SGN",
+  "date_from": "2026-06-27",
+  "date_to": null,
+  "max_price": 1000000,
+  "airline": null,
+  "trip_type": "one_way",
+  "birth_year": null,
+  "group_birth_years": null,
+  "confidence": 0.95
+}
 ```
 
 ### 4.3 API Router (Core Engine)
 - File: `api_router.py`
-- Rotation strategy:
+- **Parallel-first strategy:**
 
 ```
 search(origin, dest, date, params):
-    sources = [kiwi, amadeus, skyscanner, aviasales, serpapi]
-    for source in sources:
-        try:
-            result = source.search(...)
-            if rate_limited: continue
-            return normalize(result) + cache
-        except Exception: continue
-    return cache(stale) || []
+    sources = sorted by priority + health_score (circuit breaker check)
+    Phase 1: Gọi song song top 2 nguồn (asyncio.gather)
+             → merge kết quả, dedupe
+    Phase 2: Nếu < 3 kết quả, gọi tuần tự các nguồn còn lại
+             → dừng khi đủ limit
+    Fallback: stale cache nếu tất cả nguồn đều fail
 ```
 
-- **Kiwi/Tequila:** `api.tequila.kiwi.com` — key sandbox 'picky', hoặc đăng ký key riêng
-- **Amadeus Self-Service:** `test.api.amadeus.com` — 2,000 req/tháng test
-- **Skyscanner (RapidAPI):** `skyscanner44.p.rapidapi.com` — 50 req/min unlimited
-- **Aviasales/Jetradar (Travelpayouts):** cached prices (48h), free không cần key
-- **SerpAPI (Google Flights):** 100 req/tháng free — dùng cho fallback cuối
+**Nguồn ưu tiên:**
+| Ưu tiên | Nguồn | Key | Rate/h |
+|---------|-------|-----|--------|
+| 1 | Fly Scraper (RapidAPI) | `RAPIDAPI_KEY` | 50 |
+| 2 | Kiwi/Tequila | `KIWI_API_KEY` (sandbox: `picky`) | 500 |
+| 3 | Amadeus Self-Service | `AMADEUS_CLIENT_ID/SECRET` | 100 |
+| 4 | Skyscanner (RapidAPI) | `RAPIDAPI_KEY` | 50 |
+| 5 | Aviasales | `TRAVELPAYOUTS_TOKEN` | 200 |
+| 6 | SerpAPI | `SERPAPI_KEY` | 10 |
+
+**Tính năng nâng cao:**
+- **Circuit Breaker:** Nếu 1 nguồn fail → bị chặn 5 phút (source_health table)
+- **Health Score:** Tự động ưu tiên nguồn có tỷ lệ thành công cao
+- **Stale Cache Fallback:** Nếu cache hết hạn, vẫn có thể dùng nếu không nguồn nào hoạt động
+- **Rate Limit Tracking:** Đếm số request mỗi giờ, không vượt max_per_hour
+- **quick_price():** Lightweight check ưu tiên price-calendar, không gọi full search
 
 **Normalized output format:**
 ```python
@@ -214,67 +234,57 @@ search(origin, dest, date, params):
 ```
 
 ### 4.4 Cache Layer
-- File: [trong api_router.py]
+- File: `database.py` (functions: get_cache, set_cache, get_stale_cache, cleanup_expired_cache)
 - SQLite: `cache` table
 - TTL: 15 phút cho cùng 1 query
-- Key: hash(origin + dest + date + params)
-- Giúp avoid rate limit, tăng tốc response
+- Key: SHA256 hash(origin + dest + date_from + date_to + max_price + currency + limit)
+- **Stale cache:** Nếu cache hết hạn nhưng không có API nào hoạt động, vẫn trả về cache cũ
 
 ```sql
 CREATE TABLE cache (
     query_hash TEXT PRIMARY KEY,
-    response TEXT,          -- JSON
-    source TEXT,            -- nguồn đã dùng
-    created_at TIMESTAMP,
-    expires_at TIMESTAMP
+    response TEXT NOT NULL,
+    source TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL
 );
 ```
 
 ### 4.5 Alert Manager
 - File: `alert_manager.py`
-- Trigger-based: không có background cron
-- Alert được lưu trong SQLite
+- **Trigger-based:** Không có background cron
+- Alert được lưu trong SQLite (alerts table)
 - Chỉ check khi user:
   - Gõ `/check-alerts`
   - Hỏi "có gì mới cho tuyến X-Y không?"
-  - Bất kỳ câu hỏi nào (nhân tiện kiểm tra, tối đa 3 alert active)
-
-```sql
-CREATE TABLE alerts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    origin TEXT NOT NULL,
-    dest TEXT NOT NULL,
-    max_price INTEGER NOT NULL,
-    currency TEXT DEFAULT 'VND',
-    date_from TEXT,
-    date_to TEXT,
-    last_checked TIMESTAMP,
-    last_price INTEGER,
-    last_notified_price INTEGER,
-    active INTEGER DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+  - Bất kỳ câu hỏi nào → `incidental_check()` kiểm tra max 3 alert active, cooldown 1h
 
 **Check logic:**
 ```
-check_alert(alert):
-    if alert.last_checked < now - 1h:   # tránh check lại quá nhanh
-        price = search_one(alert.origin, alert.dest, quick=True) # 1 nguồn
+check_alert(alert, force=False):
+    if force or last_checked > 1h ago:
+        price = quick_price(alert.origin, alert.dest)  # lightweight
         if price and price <= alert.max_price:
-            if not alert.last_notified_price or price < alert.last_notified_price:
-                notify_user(alert, price)
-                update last_notified_price = price
+            if not last_notified or price < last_notified:
+                notify_user()
+                update last_notified_price
         update last_checked, last_price
 ```
 
 ### 4.6 Response Builder
 - File: `response_builder.py`
-- Dùng DeepSeek Flash v4 để format kết quả thành text đẹp
-- Templates cho từng use case
+- Dùng DeepSeek Flash v4 để format (optional — fallback sang template)
+- Templates cho từng intent:
+  - search_flight: top 5 flights với medal, time, stops, link
+  - set_alert: xác nhận + chi tiết alert
+  - check_alerts: danh sách alert + deal mới
+  - promo_check: hardcoded deal hiện tại
+  - compare: group theo hãng, sắp xếp giá
+  - price_predict: so sánh giá user vs thị trường → khuyên mua/chờ
+  - lucky_date: ngày đẹp theo can chi (hardcoded cho MVP)
+  - group_lucky_date: như trên nhưng cho nhóm
 
-**Format output:**
+**Format output (search_flight - LLM format nếu có DeepSeek, fallback template):**
 ```
 ✈️ HAN → SGN | 27/06/2026
 ─────────────────────────
@@ -335,12 +345,29 @@ CREATE TABLE cache (
     expires_at TIMESTAMP NOT NULL
 );
 
--- Rate limit tracking
+-- Rate limit tracking (per source per hour)
 CREATE TABLE rate_limits (
     source TEXT PRIMARY KEY,
     last_reset TIMESTAMP,
     count INTEGER DEFAULT 0,
     max_per_hour INTEGER
+);
+
+-- User rate limit (chống spam)
+CREATE TABLE user_rate_limits (
+    telegram_id INTEGER PRIMARY KEY,
+    window_start TIMESTAMP NOT NULL,
+    count INTEGER DEFAULT 0
+);
+
+-- Source health + circuit breaker
+CREATE TABLE source_health (
+    source TEXT PRIMARY KEY,
+    success_count INTEGER DEFAULT 0,
+    fail_count INTEGER DEFAULT 0,
+    last_success TIMESTAMP,
+    last_failure TIMESTAMP,
+    circuit_open_until TIMESTAMP
 );
 ```
 
@@ -353,25 +380,30 @@ CREATE TABLE rate_limits (
 ├── SPEC.md                    # This file
 ├── .env                       # API keys (not in git)
 ├── requirements.txt
+├── README.md                  # Project README
+├── flycheapvn.db              # SQLite database
 ├── bot.py                     # Main entry: Telegram bot handler
-├── ai_router.py               # LLM classify + entity parser
-├── api_router.py              # API rotation + normalization
-│   ├── sources/
-│   │   ├── __init__.py
-│   │   ├── kiwi.py
-│   │   ├── amadeus.py
-│   │   ├── skyscanner.py
-│   │   ├── aviasales.py
-│   │   └── serpapi.py
+├── ai_router.py               # LLM classify + entity parser + session memory
+├── api_router.py              # API rotation (parallel) + cache + circuit breaker
 ├── alert_manager.py           # Trigger-based alert system
-├── response_builder.py        # Format kết quả đẹp
-├── database.py                # SQLite init + helpers
-├── utils.py                   # Mã sân bay, currency convert, helpers
+├── response_builder.py        # Format kết quả (LLM + templates)
+├── database.py                # SQLite init + all CRUD helpers
+├── utils.py                   # Mã sân bay, currency, date parsing, regex fallback
+├── sources/
+│   ├── __init__.py            # Exports all source classes
+│   ├── fly_scraper.py         # Priority 1 — RapidAPI Skyscanner
+│   ├── kiwi.py                # Priority 2 — Kiwi/Tequila API
+│   ├── amadeus.py             # Priority 3 — Amadeus Self-Service
+│   ├── skyscanner.py          # Priority 4 — Skyscanner RapidAPI
+│   ├── aviasales.py           # Priority 5 — Aviasales/Travelpayouts
+│   └── serpapi.py             # Priority 6 — SerpAPI Google Flights
 └── tests/
-    ├── test_ai_router.py
-    ├── test_api_router.py
+    ├── __init__.py
+    ├── test_ai_router.py      # Tests for regex parser
+    ├── test_api_router.py     # Tests for cache logic
     ├── test_alert_manager.py
-    └── test_response_builder.py
+    ├── test_response_builder.py
+    └── test_fly_scraper.py
 ```
 
 ---

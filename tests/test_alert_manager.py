@@ -1,37 +1,75 @@
-"""Tests for alert manager."""
+"""Tests for AlertManager."""
 
-import tempfile
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from alert_manager import AlertManager
-from database import get_active_alerts, init_db, upsert_user
 
 
 @pytest.fixture
-def alert_setup(tmp_path):
-    db_path = tmp_path / "test.db"
-    init_db(db_path)
-    import database
-    original = database.DB_PATH
-    database.DB_PATH = db_path
-    user_id = upsert_user(telegram_id=123, chat_id=456, db_path=db_path)
-    yield user_id, db_path
-    database.DB_PATH = original
+def mock_api_router():
+    router = MagicMock()
+    router.quick_price = AsyncMock(return_value=500_000)
+    return router
 
 
-def test_set_alert(alert_setup):
-    user_id, _ = alert_setup
-    manager = AlertManager()
-    result = manager.set_alert(user_id, "HAN", "SGN", 800_000)
-    assert "alert_id" in result
+def test_set_alert_success(mock_api_router):
+    mgr = AlertManager(mock_api_router)
+    with patch("alert_manager.create_alert", return_value=42):
+        result = mgr.set_alert(
+            user_id=1,
+            origin="HAN",
+            dest="SGN",
+            max_price=800_000,
+        )
+    assert result["alert_id"] == 42
     assert result["origin"] == "HAN"
-    alerts = get_active_alerts(user_id)
-    assert len(alerts) == 1
+    assert result["dest"] == "SGN"
+    assert result["max_price"] == 800_000
 
 
-def test_set_alert_missing_route(alert_setup):
-    user_id, _ = alert_setup
-    manager = AlertManager()
-    result = manager.set_alert(user_id, "", "SGN", 800_000)
+def test_set_alert_missing_origin(mock_api_router):
+    mgr = AlertManager(mock_api_router)
+    result = mgr.set_alert(user_id=1, origin="", dest="SGN", max_price=800_000)
     assert "error" in result
+    assert "Thiếu" in result["error"]
+
+
+def test_set_alert_zero_price(mock_api_router):
+    mgr = AlertManager(mock_api_router)
+    result = mgr.set_alert(user_id=1, origin="HAN", dest="SGN", max_price=0)
+    assert "error" in result
+    assert "Thiếu" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_incidental_check_no_alerts(mock_api_router):
+    mgr = AlertManager(mock_api_router)
+    with patch("alert_manager.get_active_alerts", return_value=[]):
+        notifications = await mgr.incidental_check(user_id=1)
+    assert notifications == []
+
+
+@pytest.mark.asyncio
+async def test_incidental_check_with_notification(mock_api_router):
+    mock_alert = {
+        "id": 1, "user_id": 1,
+        "origin": "HAN", "dest": "SGN",
+        "max_price": 800_000, "currency": "VND",
+        "date_from": None, "date_to": None,
+        "last_checked": None, "last_price": None,
+        "last_notified_price": None, "active": 1,
+    }
+    mgr = AlertManager(mock_api_router)
+    with (
+        patch("alert_manager.get_active_alerts", return_value=[mock_alert]),
+        patch("alert_manager.update_alert_check"),
+    ):
+        result = await mgr.check_alerts(user_id=1, force=True)
+
+    assert len(result["alerts"]) == 1
+    assert len(result["notifications"]) == 1
+    assert result["notifications"][0]["price"] == 500_000
