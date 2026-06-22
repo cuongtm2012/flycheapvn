@@ -110,14 +110,20 @@ Bot hỗ trợ 12 loại câu hỏi tự nhiên + 2 tính năng mở rộng:
                     ┌─────────────────┼──────────────────┐
                     ▼                 ▼                  ▼
               ┌──────────┐    ┌──────────┐    ┌──────────────┐
-              │ Kiwi API  │    │ Amadeus  │    │ Skyscanner   │
-              │ Tequila   │    │ Self-Svc │    │ (RapidAPI)   │
+              │ Fly      │    │ Kiwi API  │    │ Amadeus      │
+              │ Scraper  │    │ Tequila   │    │ Self-Svc     │
               └──────────┘    └──────────┘    └──────────────┘
                     │                 │                │
               ┌──────────┐    ┌──────────┐    ┌──────────────┐
-              │ Aviasales│    │ SerpAPI  │    │ Cache SQLite  │
-              │ Jetradar │    │ G.Flight │    │ (15p TTL)     │
+              │ Skyscanner│   │ Aviasales│    │ SerpAPI      │
+              │ RapidAPI │    │ Jetradar │    │ G.Flights    │
               └──────────┘    └──────────┘    └──────────────┘
+                    │                 │                │
+              ┌──────────┐    ┌──────────┐    ┌──────────────┐
+              │ Google   │    │ Cache    │    │ SQLite DB    │
+              │ Flights  │    │ 15p TTL  │    │ alerts/users │
+              │ Playwright│   └──────────┘    └──────────────┘
+              └──────────┘
 ```
 
 ### 3.1 Data Flow
@@ -191,14 +197,20 @@ search(origin, dest, date, params):
 ```
 
 **Nguồn ưu tiên:**
-| Ưu tiên | Nguồn | Key | Rate/h |
-|---------|-------|-----|--------|
-| 1 | Fly Scraper (RapidAPI) | `RAPIDAPI_KEY` | 50 |
-| 2 | Kiwi/Tequila | `KIWI_API_KEY` (sandbox: `picky`) | 500 |
-| 3 | Amadeus Self-Service | `AMADEUS_CLIENT_ID/SECRET` | 100 |
-| 4 | Skyscanner (RapidAPI) | `RAPIDAPI_KEY` | 50 |
-| 5 | Aviasales | `TRAVELPAYOUTS_TOKEN` | 200 |
-| 6 | SerpAPI | `SERPAPI_KEY` | 10 |
+| Ưu tiên | Nguồn | Key | Rate/h | Ghi chú |
+|---------|-------|-----|--------|---------|
+| 1 | Fly Scraper (RapidAPI) | `RAPIDAPI_KEY` | 50 | Primary — price-calendar |
+| 2 | Kiwi/Tequila | `KIWI_API_KEY` (sandbox: `picky`) | 500 | Sandbox key thường 401 |
+| 3 | Amadeus Self-Service | `AMADEUS_CLIENT_ID/SECRET` | 100 | |
+| 4 | Skyscanner (RapidAPI) | `RAPIDAPI_KEY` | 50 | |
+| 5 | Aviasales | `TRAVELPAYOUTS_TOKEN` | 200 | |
+| 6 | SerpAPI | `SERPAPI_KEY` | 10 | Google Flights API |
+| 7 | Google Flights Scraper | Không cần key | 10 | **Fallback cuối** — Playwright scrape |
+
+**Chiến lược gọi nguồn:**
+- Phase 1 (parallel): Chỉ nguồn có `parallel_eligible=True` (top 2 theo priority + health)
+- Phase 2 (tuần tự): Các nguồn còn lại, gồm Google Flights Scraper khi API hết quota
+- `quick_price()`: Bỏ qua nguồn có `quick_price_eligible=False` (Google Flights quá chậm)
 
 **Tính năng nâng cao:**
 - **Circuit Breaker:** Nếu 1 nguồn fail → bị chặn 5 phút (source_health table)
@@ -396,14 +408,16 @@ CREATE TABLE source_health (
 │   ├── amadeus.py             # Priority 3 — Amadeus Self-Service
 │   ├── skyscanner.py          # Priority 4 — Skyscanner RapidAPI
 │   ├── aviasales.py           # Priority 5 — Aviasales/Travelpayouts
-│   └── serpapi.py             # Priority 6 — SerpAPI Google Flights
+│   ├── serpapi.py             # Priority 6 — SerpAPI Google Flights
+│   └── google_flights_scraper.py  # Priority 7 — Playwright fallback
 └── tests/
     ├── __init__.py
     ├── test_ai_router.py      # Tests for regex parser
     ├── test_api_router.py     # Tests for cache logic
     ├── test_alert_manager.py
     ├── test_response_builder.py
-    └── test_fly_scraper.py
+    ├── test_fly_scraper.py
+    └── test_google_flights_scraper.py
 ```
 
 ---
@@ -412,12 +426,36 @@ CREATE TABLE source_health (
 
 | API | Sign Up | Free Tier | Ghi chú |
 |-----|---------|-----------|---------|
-| Kiwi/Tequila | https://docs.kiwi.com/ | sandbox key 'picky' hoặc đăng ký key riêng | Priority 1 |
-| Amadeus | https://developers.amadeus.com/ | 2,000 req/tháng | Priority 2 |
-| Skyscanner | https://rapidapi.com/skyscanner | 50 req/min, unlimited | Priority 3 |
-| Aviasales | https://www.travelpayouts.com/ | Cached 48h free, live cần apply | Priority 4 |
-| SerpAPI | https://serpapi.com/ | 100 req/tháng free | Priority 5 (fallback) |
+| Fly Scraper | https://rapidapi.com/ (search "fly-scraper") | 250 req/tháng | **Priority 1** — primary |
+| Kiwi/Tequila | https://docs.kiwi.com/ | sandbox key `picky` hoặc đăng ký key riêng | Priority 2 |
+| Amadeus | https://developers.amadeus.com/ | 2,000 req/tháng | Priority 3 |
+| Skyscanner | https://rapidapi.com/skyscanner | Dùng chung `RAPIDAPI_KEY` | Priority 4 |
+| Aviasales | https://www.travelpayouts.com/ | Cached 48h free, live cần apply | Priority 5 |
+| SerpAPI | https://serpapi.com/ | 100 req/tháng free | Priority 6 |
+| Google Flights Scraper | Không cần key | 10 req/h (tự giới hạn) | Priority 7 — fallback |
 | DeepSeek | https://platform.deepseek.com/ | API key cho Flash v4 | AI classification |
+
+### 7.1 Google Flights Scraper (Playwright)
+
+Fallback khi tất cả API free hết quota hoặc fail. Không cần API key.
+
+**Cài đặt:**
+```bash
+pip install playwright
+playwright install chromium
+```
+
+**Cấu hình:**
+- `GOOGLE_FLIGHTS_SCRAPER=1` (mặc định) — bật fallback
+- `GOOGLE_FLIGHTS_SCRAPER=0` — tắt hoàn toàn
+
+**Đặc điểm:**
+- Lazy import Playwright — bot vẫn chạy nếu chưa cài
+- `is_configured()` trả `False` khi thiếu Playwright
+- `parallel_eligible=False` — không gọi song song (chậm ~30–45s/lần)
+- `quick_price_eligible=False` — không dùng cho alert
+- CSS selector Google DOM — có thể gãy khi Google đổi UI
+- Cảnh báo: scrape có thể vi phạm ToS Google — chỉ dùng fallback cuối
 
 ---
 
@@ -453,6 +491,7 @@ CREATE TABLE source_health (
 - Python 3.11+
 - Async (asyncio) cho Telegram handler
 - httpx cho API calls
+- playwright cho Google Flights fallback (optional)
 - python-telegram-bot v20+
 - openai-compatible client cho DeepSeek API
 - SQLite3 (stdlib)

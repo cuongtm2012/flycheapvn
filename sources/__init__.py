@@ -6,6 +6,7 @@ from .amadeus import AmadeusSource
 from .skyscanner import SkyscannerSource
 from .aviasales import AviasalesSource
 from .serpapi import SerpAPISource
+from .google_flights_scraper import GoogleFlightsScraper
 
 __all__ = [
     "KiwiSource",
@@ -14,4 +15,5 @@ __all__ = [
     "SkyscannerSource",
     "AviasalesSource",
     "SerpAPISource",
+    "GoogleFlightsScraper",
 ]

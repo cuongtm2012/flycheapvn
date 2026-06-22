@@ -16,7 +16,7 @@ from database import (
     record_source_result,
     set_cache,
 )
-from sources import AmadeusSource, AviasalesSource, FlyScraperSource, KiwiSource, SerpAPISource, SkyscannerSource
+from sources import AmadeusSource, AviasalesSource, FlyScraperSource, GoogleFlightsScraper, KiwiSource, SerpAPISource, SkyscannerSource
 from utils import format_price_vnd, make_cache_key
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,7 @@ SOURCE_PRIORITY: dict[str, int] = {
     "skyscanner": 4,
     "aviasales": 5,
     "serpapi": 6,
+    "google_flights": 7,  # Fallback cuối — Playwright scrape, chậm
 }
 
 MIN_FLIGHTS_BEFORE_STOP = 3
@@ -39,6 +40,7 @@ class APIRouter:
     def __init__(self):
         self.sources = [
             FlyScraperSource(),
+            GoogleFlightsScraper(),
             KiwiSource(),
             AmadeusSource(),
             SkyscannerSource(),
@@ -95,8 +97,10 @@ class APIRouter:
         all_flights: list[dict[str, Any]] = []
         used_sources: list[str] = []
 
-        # Phase 1: gọi song song top N nguồn nhanh nhất
-        parallel_sources = sources[:PARALLEL_TOP_N]
+        # Phase 1: gọi song song top N nguồn nhanh (bỏ nguồn chậm như Playwright)
+        parallel_sources = [
+            s for s in sources if getattr(s, "parallel_eligible", True)
+        ][:PARALLEL_TOP_N]
         if len(parallel_sources) > 1:
             tasks = [
                 self._try_source(s, origin, dest, date_from, date_to, max_price, currency, limit)
@@ -207,7 +211,7 @@ class APIRouter:
             date_from = (datetime.utcnow() + timedelta(days=7)).strftime("%Y-%m-%d")
 
         for source in self._ordered_sources():
-            if not hasattr(source, "quick_price"):
+            if not hasattr(source, "quick_price") or not getattr(source, "quick_price_eligible", True):
                 continue
             if not increment_source_rate(source.name, source.max_per_hour):
                 continue
